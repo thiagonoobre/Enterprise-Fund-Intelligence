@@ -33,7 +33,7 @@ class PipelineRoute:
     TABLE_BASE: str = f"{CATALOG}.{SCHEMA}"
 
     # 5. Caminho de Auditoria e Logs
-    AUDIT_PATH: str = f"{VOLUME_BASE}/_auditoria/pipeline_runs"
+    AUDIT_PATH: str = f"{VOLUME_BASE}/auditoria/pipeline_runs"
 
 # Instanciamos a classe para exportar o objeto pronto para uso
 ROUTES = PipelineRoute()
@@ -169,9 +169,44 @@ class PipelineConfig:
 
                         log.info(f"  → Extraído: {output_path}")
                         arquivos_salvos.append(output_path) 
+
+            if not arquivos_salvos:
+                log.warning(f"ZIP baixado de {url} não continha arquivos CSV.")
+
                         
         except Exception as e:
             log.error(f"Falha ao processar ZIP da URL {url}: {e}")
             raise
 
-    
+    @staticmethod
+    def registrar_auditoria(
+        spark,
+        audit_path: str,
+        pipeline_nome: str,
+        tabela_destino: str,
+        n_linhas: int,
+        status: str,           # "SUCESSO" | "FALHA"
+        data_proc: int,
+        mensagem: str = "",
+    ) -> None:
+        from pyspark.sql import Row
+        from datetime import datetime
+
+        registro = Row(
+            pipeline_nome   = pipeline_nome,
+            tabela_destino  = tabela_destino,
+            data_proc       = data_proc,
+            n_linhas        = n_linhas,
+            status          = status,
+            mensagem        = mensagem[:2000],
+            executado_em    = datetime.now().isoformat(),
+        )
+        (spark.createDataFrame([registro])
+            .write
+            .mode("append")
+            .format("delta")
+            .save(audit_path))
+
+
+
+
