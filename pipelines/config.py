@@ -6,6 +6,11 @@ import requests
 from dataclasses import dataclass
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as f
+from pyspark.sql import types as t
+from pyspark.sql.window import Window
+from delta.tables import DeltaTable
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -206,7 +211,228 @@ class PipelineConfig:
             .mode("append")
             .format("delta")
             .save(audit_path))
+    
+
+    @staticmethod
+    def ler_ultima_particao(spark, table_name:str, partition_col:str = "data_processamento") -> DataFrame:
+
+        try:
+            #ultima partição em formato DataFrame
+            show_partitions_df = spark.sql(f"SHOW PARTITIONS {table_name}")
+            # maior partição da data_processamento
+            max_partition = show_partitions_df.agg(f.max(partition_col)).collect()[0][0]
+            log.info(f"Partição Maxima ({partition_col}): {max_partition}")
+
+            if not max_partition:
+                log.error(f"Tabela '{table_name}' não possui dados na coluna '{partition_col}' ")
+                raise
+
+            return (spark
+                    .table(f"{table_name}")
+                    .filter(f.col(partition_col) == max_partition)
+                    )
+        except Exception as e:
+            log.error(f"Falha  ao ler o caminho {table_name}: {e}")
+            raise
 
 
+    @staticmethod
+    def normalizar_cnpj(col_name: str):
+        """
+        Remove máscaras, aceita numéricos sem zeros à esquerda 
+        e padroniza para exatamente 14 dígitos.
+        """
+        
+        #Forçar a coluna a virar texto antes de usar funções de string!
+        coluna_como_texto = f.col(col_name).cast("string")
+        
+        # Limpa tudo que não for número (0 a 9)
+        cnpj_limpo = f.regexp_replace(coluna_como_texto, r"[^0-9]", "")
+        
+        return (
+            f.when(
+                # É válido se tiver pelo menos 1 número e no máximo 14
+                (f.length(cnpj_limpo) > 0) & (f.length(cnpj_limpo) <= 14),
+                
+                # Preenche com "0" à esquerda até bater 14 posições
+                f.lpad(cnpj_limpo, 14, "0")
+                
+            ).otherwise(f.lit(None))  # Inválidos viram null
+        )
 
+
+    @staticmethod
+    def aplicar_qualidade_e_separar(
+        df: DataFrame,
+        regras: dict          # {"coluna": "tipo_esperado"}
+    ) -> tuple[DataFrame, DataFrame]:
+        """
+        Valida regras de qualidade e separa registros válidos dos inválidos.
+        Remove automaticamente as colunas temporárias de cast do DataFrame válido.
+        
+        Returns:
+            (df_valido, df_quarentena)
+        """
+        condicoes_invalidas = list()
+        colunas_cast_temporarias = list() # Rastreia as colunas criadas para limpeza
+
+        for coluna, tipo in regras.items():
+            if tipo == "decimal":
+                nome_coluna_cast = f"cast_{coluna}"
+                colunas_cast_temporarias.append(nome_coluna_cast)
+                
+                df = df.withColumn(
+                    nome_coluna_cast,
+                    f.col(coluna).cast(t.DecimalType(22, 2))
+                )
+                cond_invalida = ( 
+                    f.col(coluna).isNotNull() &
+                    f.col(nome_coluna_cast).isNull()
+                )
+                condicoes_invalidas.append(cond_invalida)
+
+            elif tipo == "date":
+                nome_coluna_cast = f"cast_{coluna}"
+                colunas_cast_temporarias.append(nome_coluna_cast)
+                
+                df = df.withColumn(
+                    nome_coluna_cast,
+                    f.to_date(f.col(coluna))
+                )
+                cond_invalida = (
+                    f.col(coluna).isNotNull() &
+                    f.col(nome_coluna_cast).isNull()
+                )
+                condicoes_invalidas.append(cond_invalida)
+
+            elif tipo == "int":
+                nome_coluna_cast = f"cast_{coluna}"
+                colunas_cast_temporarias.append(nome_coluna_cast)
+                
+                df = df.withColumn(
+                    nome_coluna_cast,
+                    f.col(coluna).cast(t.IntegerType())
+                )
+                cond_invalida = ( 
+                    f.col(coluna).isNotNull() &
+                    f.col(nome_coluna_cast).isNull()
+                )
+                condicoes_invalidas.append(cond_invalida)
+            
+            elif tipo == "not_null":
+                cond_invalida = f.col(coluna).isNull()
+                condicoes_invalidas.append(cond_invalida)
+            
+        # Agrupa todas as condições de erro com o operador OR (|)
+        condicao_quarentena = condicoes_invalidas[0]
+        for c in condicoes_invalidas[1:]:
+            condicao_quarentena = condicao_quarentena | c
+
+        df = df.withColumn("_quarentena", condicao_quarentena)
+        
+        df = df.withColumn(
+            "_motivo_quarentena",
+            f.when(
+                f.col("_quarentena"), 
+                f.lit(f"Falha de qualidade nas colunas monitoradas: {list(regras.keys())}")
+            ).otherwise(f.lit(None))
+        )
+        
+        df_valido     = df.filter(~f.col("_quarentena")).drop("_quarentena", "_motivo_quarentena", *colunas_cast_temporarias)
+        
+        # Mantemos as colunas cast no df_quarentena porque elas ajudam a diagnosticar qual coluna falhou
+        df_quarentena = df.filter(f.col("_quarentena"))
+
+        return df_valido, df_quarentena
+    
+
+    @staticmethod
+    def remover_duplicatas(df: DataFrame, chave_negocio: list, coluna_ordenacao: str) -> tuple[DataFrame, DataFrame]:
+        window_check = Window.partitionBy(chave_negocio).orderBy(f.col(coluna_ordenacao).desc())
+        df = df.withColumn("_num_linha", f.row_number().over(window_check))
+
+
+        df_duplicadas_quarentena = (df
+                                .filter(f.col("_num_linha") > 1)
+                                .withColumn("_motivo_quarentena", f.lit(f"Descarte de cópia - Chave duplicada: {chave_negocio}"))
+                                .drop("_num_linha")
+                               )
+        df_valido = (df
+                           .filter(f.col("_num_linha") == 1)
+                           .drop("_num_linha")
+                           )
+
+        return df_valido, df_duplicadas_quarentena
+
+
+    @staticmethod
+    def salvar_quarentena(spark, df_quarentena: DataFrame, tabela_origem: str, data_proc: int):
+        
+        # Se não houver dados ruins, não faz nada
+        if df_quarentena.count() == 0:
+            return
+
+        # 1. Separamos o motivo e transformamos o RESTO das colunas em um JSON string único
+        # Removemos o motivo da string JSON para não ficar redundante
+        colunas_dados = [c for c in df_quarentena.columns if c not in ["_motivo_quarentena"]]
+        
+        df_unificado = (df_quarentena
+            .withColumn("_dados_raw", f.to_json(f.struct(*colunas_dados)))
+            .select(
+                f.lit(tabela_origem).alias("_tabela_origem"),
+                f.lit(data_proc).cast("int").alias("_data_proc"),
+                f.current_timestamp().alias("_capturado_em"),
+                f.col("_motivo_quarentena").alias("_motivo_quarentena"),
+                f.col("_source_url").alias("_source_url"), 
+                f.col("_dados_raw")
+            )
+        )
+
+        tabela_destino = "workspace.case_spark_cvm.silver_quarentena"
+
+        # 2. GARANTIA DE IDEMPOTÊNCIA: Limpeza cirúrgica antes de inserir
+        if spark.catalog.tableExists(tabela_destino):
+            # Se a tabela global já existe, deletamos apenas o lote antigo DESTA pipeline DESTE dia
+            delta_table = DeltaTable.forName(spark, tabela_destino)
+            delta_table.delete(f"_tabela_origem = '{tabela_origem}' AND _data_proc = {data_proc}")
+            
+        # 3. Escrita segura via Append (o delete acima garante que não haverá duplicados do mesmo dia)
+        (df_unificado.write
+            .format("delta")
+            .mode("append")
+            .option("mergeSchema", "true") # Garante flexibilidade se a estrutura de metadados mudar
+            .saveAsTable(tabela_destino))
+            
+        log.warning(f"[QUALIDADE] {df_quarentena.count()} registros isolados na quarentena unificada de '{tabela_origem}'")
+
+
+    @staticmethod
+    def upsert_silver(spark, df_novo, tabela_destino: str, chave_negocio: list):
+        """
+        Executa MERGE INTO (upsert) na tabela Silver usando a chave de negócio.
+        """
+        
+        # Se a tabela já existir no Unity Catalog, faz o MERGE
+        if spark.catalog.tableExists(tabela_destino):
+            delta_table = DeltaTable.forName(spark, tabela_destino)
+
+            # Monta a regra de "match" dinâmica baseada na lista de chaves
+            condicao_merge = " AND ".join([f"destino.{col} = origem.{col}" for col in chave_negocio])
+
+            (delta_table.alias("destino")
+                 .merge(df_novo.alias("origem"), condicao_merge)
+                 .whenMatchedUpdateAll()    # Se já existir, atualiza tudo (Pega as correções da CVM)
+                 .whenNotMatchedInsertAll() # Se for novo, insere
+                 .execute())
+            log.info(f"MERGE executado com sucesso na tabela {tabela_destino}")
+            
+        else:
+            # Se for a primeira vez rodando, cria a tabela do zero
+            log.info(f"Tabela {tabela_destino} não existe. Criando com carga inicial...")
+            (df_novo.write
+                  .format("delta")
+                  .mode("overwrite")
+                  # Particionamento por data de negócio precisa vir do df_novo
+                  # Obs: Se for particionar, faça no notebook antes de chamar essa função!
+                  .saveAsTable(tabela_destino))
 
