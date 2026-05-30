@@ -40,44 +40,7 @@ O pipeline não apenas consolida as fontes — ele **absorve a complexidade regu
 
 ## 2. Arquitetura do Pipeline (Medallion)
 
-```mermaid
-flowchart TD
-    subgraph FONTES["📡 Fontes Externas"]
-        F1["API BCB SGS\nCDI · IPCA · SELIC\n(JSON REST)"]
-        F2["Yahoo Finance API\nIBOVESPA\n(JSON REST / Unix TS)"]
-        F3["Portal CVM\nCadastro FI — Fundos · Classes · Subclasses\n(ZIP / CSV — ISO-8859-1)"]
-        F4["Portal CVM\nInforme Diário FI\n(ZIP / CSV Mensal — Schema Drift)"]
-        F5["Portal CVM\nInforme Mensal FII\n(ZIP / CSV Anual — Schema Drift)"]
-    end
-
-    subgraph BRONZE["🥉 Bronze — Ingestão e Preservação Bruta"]
-        direction TB
-        B1["11 Tabelas Delta\nStringType universal\nRastreabilidade: _source_url + _ingest_timestamp\nPartição: data_processamento (YYYYMMDD)\nControle FinOps: janelas de execução alinhadas à CVM\nIdempotência: replaceWhere por partição"]
-    end
-
-    subgraph SILVER["⚙️ Silver — Curadoria e Confiança"]
-        direction TB
-        S1["8 Tabelas Delta + silver_quarentena\nNormalização CNPJ · Deduplicação determinística\nPriorização regulatória CVM 175\nCasting tipado em select único (Catalyst)\nMERGE full sync (insert + update + delete)\nIPCA acumulado · Índices CDI / SELIC / IPCA\nQuarentena centralizada com motivos granulares"]
-    end
-
-    subgraph GOLD["🥇 Gold — Entrega de Valor"]
-        direction TB
-        G1["9 Tabelas Delta\ngold_fato_diario — 70+ features · partição por ano_mes\ngold_dim_fundo · gold_dim_fii — SCD Tipo 1\n6 Cubos Analíticos Temáticos\nSharpe · Sortino · VaR · Alpha · Drawdown\nZ-ORDER em todas as tabelas"]
-    end
-
-    subgraph BI["📊 Consumo"]
-        direction TB
-        P1["Power BI\n7 Páginas Analíticas\nHome · Rentabilidade · Risco\nRisco × Retorno · Captação · Rankings · FII"]
-    end
-
-    AUDIT["📋 Tabela de Auditoria\n(SUCESSO / FALHA por execução)"]
-
-    F1 & F2 & F3 & F4 & F5 --> BRONZE
-    BRONZE --> SILVER
-    SILVER --> GOLD
-    BRONZE & SILVER --> AUDIT
-    GOLD --> BI
-```
+![Arquitetura do Pipeline](./Docs/Gif__image/Arquietetura.png)
 
 ### Camadas
 
@@ -139,6 +102,8 @@ A quarentena é **idempotente**: antes de cada escrita, um `DELETE` cirúrgico p
 ---
 
 ## 4. Engenharia de Analytics e Business Intelligence (Power BI)
+
+![Demonstração do Dashboard Analítico](Docs/Gif__image/V1-0001_Vídeo.gif) 
 
 ### Camada Semântica
 
