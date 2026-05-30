@@ -423,6 +423,7 @@ class PipelineConfig:
                  .merge(df_novo.alias("origem"), condicao_merge)
                  .whenMatchedUpdateAll()    # Se já existir, atualiza tudo (Pega as correções da CVM)
                  .whenNotMatchedInsertAll() # Se for novo, insere
+                 .whenNotMatchedBySourceDelete()
                  .execute())
             log.info(f"MERGE executado com sucesso na tabela {tabela_destino}")
             
@@ -435,4 +436,111 @@ class PipelineConfig:
                   # Particionamento por data de negócio precisa vir do df_novo
                   # Obs: Se for particionar, faça no notebook antes de chamar essa função!
                   .saveAsTable(tabela_destino))
+            
+
+    @staticmethod
+    def gravar_dimensao_gold(spark, df_novo, tabela_destino: str, chave_pk: list[str]):
+        """
+        SCD Tipo 1 — sobrescreve atributos alterados, mantém a chave.
+        Escolha quando o BI não precisa de histórico de mudanças cadastrais.
+        """
+        if spark.catalog.tableExists(tabela_destino):
+            delta = DeltaTable.forName(spark, tabela_destino)
+            condicao = " AND ".join([f"d.{c} = n.{c}" for c in chave_pk])
+
+            (delta.alias("d")
+                .merge(df_novo.alias("n"), condicao)
+                .whenMatchedUpdateAll()
+                .whenNotMatchedInsertAll()
+                .execute())
+        else:
+            log.info(f"[GOLD] Tabela {tabela_destino} não encontrada. Criando nova tabela...")
+            (df_novo.write
+                    .format("delta")
+                    .mode("overwrite")
+                    .saveAsTable(tabela_destino))
+            
+        log.info(f"Aplicando OPTIMIZE e Z-ORDER na tabela {tabela_destino}...")
+        # Dimensões são pequenas — OPTIMIZE é barato e essencial para o BI
+        spark.sql(f"OPTIMIZE {tabela_destino} ZORDER BY ({chave_pk[0]})")
+
+
+    @staticmethod
+    def gravar_fato_diario_gold(
+        spark,
+        df_novo,
+        tabela_destino: str,
+        coluna_particao: str = "ano_mes",
+        zorder_cols: list = None,
+        n_reparticoes: int = None,
+    ):
+        import pyspark.sql.functions as f
+        import logging
+        log = logging.getLogger(__name__)
+
+        log.info(f"[GOLD] Iniciando gravação em '{tabela_destino}' | Modo: Dynamic Partition Overwrite via Option")
+
+        # 1. Reparticionamento Físico
+        if n_reparticoes:
+            df_para_gravar = df_novo.repartition(n_reparticoes, coluna_particao)
+        else:
+            df_para_gravar = df_novo.repartition(coluna_particao)
+
+        # 2. Verifica se a tabela já existe no Unity Catalog (Modo Correto)
+        tabela_existe = spark.catalog.tableExists(tabela_destino)
+
+        # 3. Preparação do Writer com a configuração embuitda (A SOLUÇÃO DO ERRO AQUI)
+        writer = (df_para_gravar.write
+                  .format("delta")
+                  .mode("overwrite")
+                  .option("mergeSchema", "true")
+                  .partitionBy(coluna_particao)
+                  # Usamos .option() no lugar de spark.conf.set() para não ser bloqueado pelo Unity Catalog
+                  .option("partitionOverwriteMode", "dynamic"))
+
+        # 4. Executa a escrita
+        if tabela_existe:
+            writer.saveAsTable(tabela_destino)
+        else:
+            log.info(f"[GOLD] Tabela não existe. Criando pela primeira carga...")
+            writer.saveAsTable(tabela_destino)
+
+        log.info(f"[GOLD] Escrita concluída em '{tabela_destino}'.")
+
+        # 5. OTIMIZE (Opcional por design para não travar Backfills)
+        if zorder_cols:
+            zorder_clause = ", ".join(zorder_cols)
+            log.info(f"[GOLD] Aplicando OPTIMIZE + ZORDER BY ({zorder_clause})")
+            spark.sql(f"OPTIMIZE {tabela_destino} ZORDER BY ({zorder_clause})")
+            log.info(f"[GOLD] OPTIMIZE concluído.")
+    
+
+    @staticmethod
+    def gravar_cubo_gold(
+        spark,
+        df_cubo, # Aqui você pode tipar como DataFrame se importar de pyspark.sql
+        tabela_destino: str,
+        zorder_cols: list[str],
+        coluna_particao: str = None # <-- Parâmetro único, opcional e com nome claro
+    ):
+        """
+        Full Overwrite — o cubo é sempre recomputado do zero a partir da Fato.
+        Se 'coluna_particao' for informada, particiona dinamicamente.
+        """
+        writer = (df_cubo.write
+                        .format("delta")
+                        .mode("overwrite")
+                        .option("overwriteSchema", "true"))  # aceita evolução de schema
+
+        # Se a variável tem algum valor diferente de None/Vazio, ele particiona
+        if coluna_particao:
+            writer = writer.partitionBy(coluna_particao)
+
+        writer.saveAsTable(tabela_destino)
+
+        # OPTIMIZE com Z-ORDER nas colunas de filtro do BI
+        zorder_clause = ", ".join(zorder_cols)
+        spark.sql(f"OPTIMIZE {tabela_destino} ZORDER BY ({zorder_clause})")
+
+        log.info(f"Cubo {tabela_destino} regravado. Z-ORDER: {zorder_cols}. Partição: {coluna_particao}")
 
