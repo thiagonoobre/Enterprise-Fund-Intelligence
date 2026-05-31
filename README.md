@@ -46,9 +46,9 @@ O pipeline não apenas consolida as fontes — ele **absorve a complexidade regu
 
 | Camada | Responsabilidade | Tabelas | Documentação |
 |---|---|---|---|
-| 🥉 **Bronze** | Ingestão, preservação e rastreabilidade. Dados brutos como strings, particionados por data de processamento. Nunca transformados semanticamente. | 11 | [📖 BRONZE.md](./docs/BRONZE.md) |
-| ⚙️ **Silver** | Curadoria, tipagem forte, deduplicação com regras por domínio, validação de qualidade e isolamento de rejeições. MERGE incremental com sincronização completa. | 9 | [📖 SILVER.md](./docs/SILVER.md) |
-| 🥇 **Gold** | Entrega de valor: 70+ features financeiras calculadas, dimensões cadastrais SCD Tipo 1 e cubos analíticos temáticos prontos para consumo sem transformação adicional. | 9 | [📖 GOLD.md](./docs/GOLD.md) |
+| 🥉 **Bronze** | Ingestão, preservação e rastreabilidade. Dados brutos como strings, particionados por data de processamento. Nunca transformados semanticamente. | 11 | [📖 BRONZE.md](./Docs/BRONZE.md) |
+| ⚙️ **Silver** | Curadoria, tipagem forte, deduplicação com regras por domínio, validação de qualidade e isolamento de rejeições. MERGE incremental com sincronização completa. | 9 | [📖 SILVER.md](./Docs/SILVER.md) |
+| 🥇 **Gold** | Entrega de valor: 70+ features financeiras calculadas, dimensões cadastrais SCD Tipo 1 e cubos analíticos temáticos prontos para consumo sem transformação adicional. | 9 | [📖 GOLD.md](./Docs/GOLD.md) |
 
 ---
 
@@ -356,12 +356,4 @@ Os 5 cubos derivados de `gold_fato_diario` executam full scan da tabela independ
 
 O processo atual de descoberta de arquivos ZIP usa `BeautifulSoup` para parsear HTML + regex para filtrar nomes de arquivo. O **Auto Loader** do Databricks oferece ingestão incremental baseada em checkpoints de arquivos em storage, eliminando a necessidade de scraping, gerenciando automaticamente quais arquivos já foram processados e habilitando ingestão contínua (Structured Streaming) em vez de batch. Combinado com o Unity Catalog para lineage automático, seria a evolução natural de maturidade para esta camada.
 
----
 
-<div align="center">
-
-**Construído com rigor técnico e compreensão do mercado financeiro brasileiro**
-
-*Engenharia de Dados · Analytics Engineering · Business Intelligence · Delta Lake · Apache Spark*
-
-</div>
