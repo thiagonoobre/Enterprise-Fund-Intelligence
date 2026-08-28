@@ -1,0 +1,10 @@
+# Audit documentation files
+audit/*.md
+!audit/README.md
+
+# General documentation (if needed for context)
+docs/
+*.md
+!README.md
+!LICENSE
+!NOTICE
